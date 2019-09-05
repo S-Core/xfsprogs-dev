@@ -54,6 +54,7 @@ typedef struct t_args {
 	uuid_t		uuid;
 	pthread_mutex_t	wait;
 	int		fd;
+	int    mode;    /* 0 : normal, 1 : compact dump mode */
 } thread_args;
 
 typedef struct {

@@ -18,6 +18,11 @@
 
 extern int	platform_check_ismounted(char *, char *, struct stat *, int);
 
+typedef struct wbuf_seg {
+	__be64 pos;
+	__be64 len;
+} wbuf_seg;
+
 static char 		*logfile_name;
 static FILE		*logerr;
 static char		LOGFILE_NAME[] = "/var/tmp/xfs_copy.log.XXXXXX";
@@ -177,17 +182,34 @@ do_write(
 	if (!buf)
 		buf = &w_buf;
 
-	if (target[args->id].position != buf->position)  {
-		if (lseek(args->fd, buf->position, SEEK_SET) < 0)  {
-			error = target[args->id].err_type = 1;
+	if (!args->mode) {
+		if (target[args->id].position != buf->position)  {
+			if (lseek(args->fd, buf->position, SEEK_SET) < 0)  {
+				error = target[args->id].err_type = 1;
+			} else  {
+				target[args->id].position = buf->position;
+			}
+		}
+	} else if (args->mode == 1) {
+		wbuf_seg tmp;
+
+		tmp.pos = cpu_to_be64(buf->position);
+		tmp.len = cpu_to_be64(buf->length);
+
+		if ((res = write(target[args->id].fd, &tmp,
+					sizeof(tmp))) == sizeof(tmp))  {
+			target[args->id].position += res;
 		} else  {
-			target[args->id].position = buf->position;
+			error = 2;
 		}
 	}
 
 	if ((res = write(target[args->id].fd, buf->data,
 				buf->length)) == buf->length)  {
 		target[args->id].position += res;
+#ifdef XFSDBG
+		do_warn(_("position - length : %lld - %lld\n"), buf->position, buf->length);
+#endif // XFSDBG
 	} else  {
 		error = 2;
 	}
@@ -293,7 +315,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-		_("Usage: %s [-bdV] [-L logfile] source target [target ...]\n"),
+		_("Usage: %s [-fsbdV] [-L logfile] source target [target ...]\n"),
 		progname);
 	exit(1);
 }
@@ -409,6 +431,105 @@ read_wbuf(int fd, wbuf *buf, xfs_mount_t *mp)
 		ASSERT(res == buf->length);
 	source_position += res;
 	buf->length = res;
+}
+
+static int
+read_rbuf(int fd, wbuf *buf)
+{
+	wbuf_seg tmp;
+	int res = read(fd, &tmp, sizeof(tmp));
+
+	if (res == 0)
+		return 0;
+
+	if (res != sizeof(tmp))  {
+		do_warn(_("%s:  read(header) failure at offset %lld\n"),
+				progname, source_position);
+		die_perror();
+	}
+
+	buf->position = be64_to_cpu(tmp.pos);
+	buf->length = be64_to_cpu(tmp.len);
+
+	source_position += res;
+
+#ifdef XFSDBG
+	do_log(_("position - length : %lld - %lld\n"), buf->position, buf->length);
+#endif // XFSDBG
+
+	res = read(source_fd, buf->data, buf->length);
+	if (res != buf->length) {
+		do_warn(_("%s:  read(data) failure at offset %lld\n"),
+				progname, source_position);
+		die_perror();
+	}
+	source_position += res;
+
+	return res;
+}
+
+
+static void
+write_integer(int target_no, void *buf, int size)
+{
+	__be64 tmp;
+
+	switch (size) {
+	case 2:
+		tmp = cpu_to_be16(*(__u16 *)buf);
+		break;
+	case 4:
+		tmp = cpu_to_be32(*(__u32 *)buf);
+		break;
+	case 8:
+		tmp = cpu_to_be64(*(__u64 *)buf);
+		break;
+	default:
+		do_warn(_("%s:  write(value) - invalid parameter %d\n"),
+				progname, size);
+		die_perror();
+		break;
+	}
+
+	if (write(target[target_no].fd, &tmp, size) == size)  {
+		target[target_no].position += size;
+	} else  {
+		do_log(_("%s: failed to write disk size to \'%s\'\n"),
+				progname, target[target_no].name);
+		die_perror();
+	}
+}
+
+static void
+read_integer(int fd, void *buf, int size)
+{
+	__be64 tmp;
+	int res = read(source_fd, &tmp, size);
+
+	if (res != size)  {
+		do_warn(_("%s:  read(value) failure at offset %lld\n"),
+				progname, source_position);
+		die_perror();
+	}
+
+	switch (size) {
+	case 2:
+		*(__u16 *)buf = be16_to_cpu(tmp);
+		break;
+	case 4:
+		*(__u32 *)buf = be32_to_cpu(tmp);
+		break;
+	case 8:
+		*(__u64 *)buf = be64_to_cpu(tmp);
+		break;
+	default:
+		do_warn(_("%s:  read(value) - invalid parameter %d\n"),
+				progname, size);
+		die_perror();
+		break;
+	}
+
+	source_position += res;
 }
 
 static void
@@ -542,6 +663,8 @@ main(int argc, char **argv)
 	int		wbuf_align;
 	int		wbuf_miniosize;
 	int		source_is_file = 0;
+	int		stream_input = 0;
+	int		stream_output = 0;
 	int		buffered_output = 0;
 	int		duplicate = 0;
 	uint		btree_levels, current_level;
@@ -562,6 +685,8 @@ main(int argc, char **argv)
 	libxfs_init_t	xargs;
 	thread_args	*tcarg;
 	struct stat	statbuf;
+	off64_t 	source_size = 0;
+	int		rbuf_size = 0;
 
 	progname = basename(argv[0]);
 
@@ -569,8 +694,25 @@ main(int argc, char **argv)
 	bindtextdomain(PACKAGE, LOCALEDIR);
 	textdomain(PACKAGE);
 
-	while ((c = getopt(argc, argv, "bdL:V")) != EOF)  {
+	while ((c = getopt(argc, argv, "fsbdL:V")) != EOF)  {
 		switch (c) {
+		case 'f':
+			if (stream_output > 0) {
+				fprintf(stderr,
+					_("%s: \'-f\' must not used together with \'-s\'\n"),
+					progname);
+				usage();
+			}
+			stream_input = 1;
+			break;
+		case 's':
+			if (stream_input > 0) {
+				fprintf(stderr,
+					_("%s: \'-f\' must not used together with \'-s\'\n"),
+					progname);
+				usage();
+			}
+			stream_output = 1;
 		case 'b':
 			buffered_output = 1;
 			break;
@@ -648,8 +790,15 @@ main(int argc, char **argv)
 
 	if (S_ISREG(statbuf.st_mode))
 		source_is_file = 1;
+	else if (stream_input) {
+		do_log(_("%s: have to use \'-f\' flag with regular file.\n"),
+			progname);
+		do_log(_("\t\"%s\" is not regular file.\n"),
+			source_name);
+		die_perror();
+	}
 
-	if (source_is_file && platform_test_xfs_fd(source_fd))  {
+	if (!stream_input && source_is_file && platform_test_xfs_fd(source_fd))  {
 		if (fcntl(source_fd, F_SETFL, open_flags | O_DIRECT) < 0)  {
 			do_log(_("%s: Cannot set direct I/O flag on \"%s\".\n"),
 				progname, source_name);
@@ -688,101 +837,112 @@ main(int argc, char **argv)
 		}
 	}
 
-	/* prepare the libxfs_init structure */
+	if (stream_input)  {
+		source_position = 0;
 
-	memset(&xargs, 0, sizeof(xargs));
-	xargs.isdirect = LIBXFS_DIRECT;
-	xargs.isreadonly = LIBXFS_ISREADONLY;
-
-	if (source_is_file)  {
-		xargs.dname = source_name;
-		xargs.disfile = 1;
-	} else
-		xargs.volname = source_name;
-
-	if (!libxfs_init(&xargs))  {
-		do_log(_("%s: couldn't initialize XFS library\n"
-			"%s: Aborting.\n"), progname, progname);
-		exit(1);
+		read_integer(source_fd, &source_size, sizeof(source_size));
+		read_integer(source_fd, &source_blocksize, sizeof(source_blocksize));
+		read_integer(source_fd, &wbuf_miniosize, sizeof(wbuf_miniosize));
+		read_integer(source_fd, &wbuf_align, sizeof(wbuf_align));
+		read_integer(source_fd, &rbuf_size, sizeof(rbuf_size));
 	}
+	else {
+		/* prepare the libxfs_init structure */
 
-	memset(&mbuf, 0, sizeof(xfs_mount_t));
+		memset(&xargs, 0, sizeof(xargs));
+		xargs.isdirect = LIBXFS_DIRECT;
+		xargs.isreadonly = LIBXFS_ISREADONLY;
 
-	/* We don't yet know the sector size, so read maximal size */
-	libxfs_buftarg_init(&mbuf, xargs.ddev, xargs.logdev, xargs.rtdev);
-	sbp = libxfs_readbuf(mbuf.m_ddev_targp, XFS_SB_DADDR,
-			     1 << (XFS_MAX_SECTORSIZE_LOG - BBSHIFT), 0, NULL);
-	sb = &mbuf.m_sb;
-	libxfs_sb_from_disk(sb, XFS_BUF_TO_SBP(sbp));
+		if (source_is_file)  {
+			xargs.dname = source_name;
+			xargs.disfile = 1;
+		} else
+			xargs.volname = source_name;
 
-	/* Do it again, now with proper length and verifier */
-	libxfs_putbuf(sbp);
-	libxfs_purgebuf(sbp);
-	sbp = libxfs_readbuf(mbuf.m_ddev_targp, XFS_SB_DADDR,
-			     1 << (sb->sb_sectlog - BBSHIFT),
-			     0, &xfs_sb_buf_ops);
-	libxfs_putbuf(sbp);
-
-	mp = libxfs_mount(&mbuf, sb, xargs.ddev, xargs.logdev, xargs.rtdev, 0);
-	if (mp == NULL) {
-		do_log(_("%s: %s filesystem failed to initialize\n"
-			"%s: Aborting.\n"), progname, source_name, progname);
-		exit(1);
-	} else if (mp->m_sb.sb_inprogress)  {
-		do_log(_("%s %s filesystem failed to initialize\n"
-			"%s: Aborting.\n"), progname, source_name, progname);
-		exit(1);
-	} else if (mp->m_sb.sb_logstart == 0)  {
-		do_log(_("%s: %s has an external log.\n%s: Aborting.\n"),
-			progname, source_name, progname);
-		exit(1);
-	} else if (mp->m_sb.sb_rextents != 0)  {
-		do_log(_("%s: %s has a real-time section.\n"
-			"%s: Aborting.\n"), progname, source_name, progname);
-		exit(1);
-	}
-
-
-	/*
-	 * Set up the mount pointer to access the log and check whether the log
-	 * is clean. Fail on a dirty or corrupt log in non-duplicate mode
-	 * because the log is formatted as part of the copy and we don't want to
-	 * destroy data. We also need the current log cycle to format v5
-	 * superblock logs correctly.
-	 */
-	memset(&xlog, 0, sizeof(struct xlog));
-	mp->m_log = &xlog;
-	c = xlog_is_dirty(mp, mp->m_log, &xargs, 0);
-	if (!duplicate) {
-		if (c == 1) {
-			do_log(_(
-"Error: source filesystem log is dirty. Mount the filesystem to replay the\n"
-"log, unmount and retry xfs_copy.\n"));
-			exit(1);
-		} else if (c < 0) {
-			do_log(_(
-"Error: could not determine the log head or tail of the source filesystem.\n"
-"Mount the filesystem to replay the log or run xfs_repair.\n"));
+		if (!libxfs_init(&xargs))  {
+			do_log(_("%s: couldn't initialize XFS library\n"
+				"%s: Aborting.\n"), progname, progname);
 			exit(1);
 		}
+
+		memset(&mbuf, 0, sizeof(xfs_mount_t));
+
+		/* We don't yet know the sector size, so read maximal size */
+		libxfs_buftarg_init(&mbuf, xargs.ddev, xargs.logdev, xargs.rtdev);
+		sbp = libxfs_readbuf(mbuf.m_ddev_targp, XFS_SB_DADDR,
+				     1 << (XFS_MAX_SECTORSIZE_LOG - BBSHIFT), 0, NULL);
+		sb = &mbuf.m_sb;
+		libxfs_sb_from_disk(sb, XFS_BUF_TO_SBP(sbp));
+
+		/* Do it again, now with proper length and verifier */
+		libxfs_putbuf(sbp);
+		libxfs_purgebuf(sbp);
+		sbp = libxfs_readbuf(mbuf.m_ddev_targp, XFS_SB_DADDR,
+				     1 << (sb->sb_sectlog - BBSHIFT),
+				     0, &xfs_sb_buf_ops);
+		libxfs_putbuf(sbp);
+
+		mp = libxfs_mount(&mbuf, sb, xargs.ddev, xargs.logdev, xargs.rtdev, 0);
+		if (mp == NULL) {
+			do_log(_("%s: %s filesystem failed to initialize\n"
+				"%s: Aborting.\n"), progname, source_name, progname);
+			exit(1);
+		} else if (mp->m_sb.sb_inprogress)  {
+			do_log(_("%s %s filesystem failed to initialize\n"
+				"%s: Aborting.\n"), progname, source_name, progname);
+			exit(1);
+		} else if (mp->m_sb.sb_logstart == 0)  {
+			do_log(_("%s: %s has an external log.\n%s: Aborting.\n"),
+				progname, source_name, progname);
+			exit(1);
+		} else if (mp->m_sb.sb_rextents != 0)  {
+			do_log(_("%s: %s has a real-time section.\n"
+				"%s: Aborting.\n"), progname, source_name, progname);
+			exit(1);
+		}
+
+
+		/*
+		 * Set up the mount pointer to access the log and check whether the log
+		 * is clean. Fail on a dirty or corrupt log in non-duplicate mode
+		 * because the log is formatted as part of the copy and we don't want to
+		 * destroy data. We also need the current log cycle to format v5
+		 * superblock logs correctly.
+		 */
+		memset(&xlog, 0, sizeof(struct xlog));
+		mp->m_log = &xlog;
+		c = xlog_is_dirty(mp, mp->m_log, &xargs, 0);
+		if (!duplicate) {
+			if (c == 1) {
+				do_log(_(
+	"Error: source filesystem log is dirty. Mount the filesystem to replay the\n"
+	"log, unmount and retry xfs_copy.\n"));
+				exit(1);
+			} else if (c < 0) {
+				do_log(_(
+	"Error: could not determine the log head or tail of the source filesystem.\n"
+	"Mount the filesystem to replay the log or run xfs_repair.\n"));
+				exit(1);
+			}
+		}
+
+		source_blocksize = mp->m_sb.sb_blocksize;
+		source_sectorsize = mp->m_sb.sb_sectsize;
+
+		if (wbuf_miniosize == -1)
+			wbuf_miniosize = source_sectorsize;
+
+		ASSERT(source_blocksize % source_sectorsize == 0);
+		ASSERT(source_sectorsize % BBSIZE == 0);
+
+		if (source_blocksize < source_sectorsize)  {
+			do_log(_("Error:  filesystem block size is smaller than the"
+				" disk sectorsize.\nAborting XFS copy now.\n"));
+			exit(1);
+		}
+
+		first_agbno = XFS_AGFL_BLOCK(mp) + 1;
 	}
-
-	source_blocksize = mp->m_sb.sb_blocksize;
-	source_sectorsize = mp->m_sb.sb_sectsize;
-
-	if (wbuf_miniosize == -1)
-		wbuf_miniosize = source_sectorsize;
-
-	ASSERT(source_blocksize % source_sectorsize == 0);
-	ASSERT(source_sectorsize % BBSIZE == 0);
-
-	if (source_blocksize < source_sectorsize)  {
-		do_log(_("Error:  filesystem block size is smaller than the"
-			" disk sectorsize.\nAborting XFS copy now.\n"));
-		exit(1);
-	}
-
-	first_agbno = XFS_AGFL_BLOCK(mp) + 1;
 
 	/* now open targets */
 
@@ -828,46 +988,68 @@ main(int argc, char **argv)
 			die_perror();
 		}
 
-		if (write_last_block)  {
-			/* ensure regular files are correctly sized */
+		if (!stream_output) {
+			off64_t	off = stream_input ? source_size :
+								mp->m_sb.sb_dblocks * source_blocksize;
 
-			if (ftruncate(target[i].fd, mp->m_sb.sb_dblocks *
-						source_blocksize))  {
-				do_log(_("%s:  cannot grow data section.\n"),
-					progname);
-				die_perror();
-			}
-			if (platform_test_xfs_fd(target[i].fd))  {
-				if (xfsctl(target[i].name, target[i].fd,
-						XFS_IOC_DIOINFO, &d) < 0)  {
-					do_log(
-				_("%s:  xfsctl on \"%s\" failed.\n"),
-						progname, target[i].name);
+			if (write_last_block)  {
+				/* ensure regular files are correctly sized */
+
+				if (ftruncate(target[i].fd, off))  {
+					do_log(_("%s:  cannot grow data section.\n"),
+						progname);
 					die_perror();
-				} else {
-					wbuf_align = max(wbuf_align, d.d_mem);
-					wbuf_size = min(d.d_maxiosz, wbuf_size);
-					wbuf_miniosize = max(d.d_miniosz,
-								wbuf_miniosize);
+				}
+				if (platform_test_xfs_fd(target[i].fd))  {
+					if (xfsctl(target[i].name, target[i].fd,
+							XFS_IOC_DIOINFO, &d) < 0)  {
+						do_log(
+					_("%s:  xfsctl on \"%s\" failed.\n"),
+							progname, target[i].name);
+						die_perror();
+					} else {
+						wbuf_align = max(wbuf_align, d.d_mem);
+						wbuf_size = min(d.d_maxiosz, wbuf_size);
+						wbuf_miniosize = max(d.d_miniosz,
+									wbuf_miniosize);
+					}
+				}
+			} else  {
+				char	*lb[XFS_MAX_SECTORSIZE] = { NULL };
+
+				/* ensure device files are sufficiently large */
+
+				off -= sizeof(lb);
+				if (pwrite(target[i].fd, lb, sizeof(lb), off) < 0)  {
+					do_log(_("%s:  failed to write last block\n"),
+						progname);
+					do_log(_("\tIs target \"%s\" too small?\n"),
+						target[i].name);
+					die_perror();
 				}
 			}
-		} else  {
-			char	*lb[XFS_MAX_SECTORSIZE] = { NULL };
-			off64_t	off;
+		}
+		else {
+			source_size = mp->m_sb.sb_dblocks * source_blocksize;
+			rbuf_size = XFS_FSB_TO_B(mp, mp->m_sb.sb_logblocks);
+			if (rbuf_size < wbuf_size)
+				rbuf_size = wbuf_size;
 
-			/* ensure device files are sufficiently large */
-
-			off = mp->m_sb.sb_dblocks * source_blocksize;
-			off -= sizeof(lb);
-			if (pwrite(target[i].fd, lb, sizeof(lb), off) < 0)  {
-				do_log(_("%s:  failed to write last block\n"),
-					progname);
-				do_log(_("\tIs target \"%s\" too small?\n"),
-					target[i].name);
-				die_perror();
-			}
+			write_integer(i, &source_size, sizeof(source_size));
+			write_integer(i, &source_blocksize, sizeof(source_blocksize));
+			write_integer(i, &wbuf_miniosize, sizeof(wbuf_miniosize));
+			write_integer(i, &wbuf_align, sizeof(wbuf_align));
+			write_integer(i, &rbuf_size, sizeof(rbuf_size));
 		}
 	}
+
+#ifdef XFSDBG
+	do_log(_("source_size : %d\n"), source_size);
+	do_log(_("source_blocksize : %d\n"), source_blocksize);
+	do_log(_("wbuf_miniosize : %d\n"), wbuf_miniosize);
+	do_log(_("wbuf_align : %d\n"), wbuf_align);
+	do_log(_("rbuf_size : %d\n"), rbuf_size);
+#endif // XFSDBG
 
 	/* initialize locks and bufs */
 
@@ -877,11 +1059,22 @@ main(int argc, char **argv)
 	}
 	glob_masks.num_working = 0;
 
+	if (stream_input && rbuf_size > wbuf_size) {
+		wbuf_size = rbuf_size;
+	}
+
+#ifdef XFSDBG
+	do_log(_("wbuf_size : %d\n"), wbuf_size);
+	do_log(_("wbuf_align : %d\n"), wbuf_align);
+#endif // XFSDBG
+
 	if (wbuf_init(&w_buf, wbuf_size, wbuf_align,
 					wbuf_miniosize, 0) == NULL)  {
 		do_log(_("Error initializing wbuf 0\n"));
 		die_perror();
 	}
+
+	do_log(_("wbuf.data : %p\n"), w_buf.data);
 
 	wblocks = wbuf_size / BBSIZE;
 
@@ -915,7 +1108,7 @@ main(int argc, char **argv)
 	for (i = 0, tcarg = targ; i < num_targets; i++, tcarg++)  {
 		if (!duplicate)
 			platform_uuid_generate(&tcarg->uuid);
-		else
+		else if (!stream_input)
 			platform_uuid_copy(&tcarg->uuid, &mp->m_sb.sb_uuid);
 
 		if (pthread_mutex_init(&tcarg->wait, NULL) != 0)  {
@@ -930,6 +1123,7 @@ main(int argc, char **argv)
 	for (i = 0, tcarg = targ; i < num_targets; i++, tcarg++)  {
 		tcarg->id = i;
 		tcarg->fd = target[i].fd;
+		tcarg->mode = stream_output;
 
 		target[i].state = ACTIVE;
 		num_threads++;
@@ -942,6 +1136,15 @@ main(int argc, char **argv)
 	}
 
 	ASSERT(num_targets == num_threads);
+
+	if (stream_input) {
+		while (read_rbuf(source_fd, &w_buf) > 0) {
+			write_wbuf();
+		}
+
+		check_errors();
+		return 0;
+	}
 
 	/* set up statistics */
 
